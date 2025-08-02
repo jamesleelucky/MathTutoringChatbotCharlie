@@ -1,5 +1,7 @@
 import streamlit as st
 import sys
+import re 
+import time 
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
 from langchain.text_splitter import CharacterTextSplitter
@@ -10,6 +12,7 @@ from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
 from langchain.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
 from templates import css, bot_template, user_template
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 st.set_page_config(page_title='Chat with multiple PDFs', page_icon=':books:')
 
@@ -29,14 +32,23 @@ def get_text(pdf_docs):
 # ==============================
 # Text Chunking
 # ==============================
+# def get_chunks(text):
+#     text_splitter = CharacterTextSplitter(
+#         separator='\n',
+#         chunk_size=1000,
+#         chunk_overlap=200,
+#         length_function=len
+#     )
+#     chunks = text_splitter.split_text(text)
+#     return chunks
 def get_chunks(text):
-    text_splitter = CharacterTextSplitter(
-        separator='\n',
-        chunk_size=1000,
-        chunk_overlap=200,
+    splitter = RecursiveCharacterTextSplitter(
+        separators=["\nProblem", "\n\n", "\n", ".", " ", ""],
+        chunk_size=10000,  # Larger chunk to preserve context
+        chunk_overlap=900,
         length_function=len
     )
-    chunks = text_splitter.split_text(text)
+    chunks = splitter.split_text(text)
     return chunks
 
 # ==============================
@@ -59,26 +71,34 @@ def get_conversation_chain(vectorstore):
     )
 
     system_prompt = """
-        You are the best math tutor in the world. Solve ONLY the given question using the provided context.
+        You are the most intelligent math tutor in this world. Solve ONLY the given question using the provided context.
         Do NOT invent problems that are not in the question.
-
 
         Format your response as:
 
         Solution:
-        1. Explain what the equation is. State the original equation clearly in normal Math expressions, not LeTex commands.
+        1. Explain what the equation is. 
+            Clearly state the equation using MathJax formatting.
+            - For inline math use single dollar signs: $...$
+            - For displayed equations use double dollar signs: $$...$$
+            DO NOT use square brackets [ ] or raw LaTeX commands without MathJax delimiters.
 
-        2. Show the steps to solve the problem. DO NOT use raw LaTeX like \equiv and \pmod in the explanation. Use plain English text with normal Math expressions instead. DO NOT use raw LaTeX like \equiv and \pmod in the explanation. Use plain English text with normal Math expressions instead.DO NOT use raw LaTeX like \equiv and \pmod in the explanation. Use plain English text with normal Math expressions instead.
+        2. Show the steps to solve the problem. 
+            Clearly use MathJax formatting for all equations.
+            - Inline math: $...$
+            - Display math: $$...$$
+            DO NOT use square brackets [ ] for equations.
 
         3. Conclusion:
-            State final result or that no solution exists.
+            State the final result.
 
         Rules:
-        - Use clear English with MathJax for math.
+        - Use clear English and MathJax for math.
         - Do NOT approximate unless required.
-        - No LaTeX code outside MathJax blocks.
+        - DO NOT use raw LaTeX outside of MathJax delimiters.
         If possible, compute the numeric value.
-        """
+    """
+
 
     messages = [
         SystemMessagePromptTemplate.from_template(system_prompt),
@@ -99,15 +119,53 @@ def get_conversation_chain(vectorstore):
 # ==============================
 # Display Chat
 # ==============================
+
 def handle_userinput(user_question):
     response = st.session_state.conversation({'question': user_question})
     st.session_state.chat_history = response['chat_history']
 
+    # Replace [ ... ] with $$...$$ explicitly
+    def convert_brackets_to_mathjax(text):
+        return re.sub(r'\[(.+?)\]', r'$$\1$$', text, flags=re.DOTALL)
+
     for i, message in enumerate(st.session_state.chat_history):
+        content = convert_brackets_to_mathjax(message.content)
+        
         if i % 2 == 0:
-            st.write(user_template.replace("{{MSG}}", message.content), unsafe_allow_html=True)
+            st.write(user_template.replace("{{MSG}}", content), unsafe_allow_html=True)
         else:
-            st.write(bot_template.replace("{{MSG}}", message.content), unsafe_allow_html=True)
+            st.write(bot_template.replace("{{MSG}}", content), unsafe_allow_html=True)
+
+# def handle_userinput(user_question):
+#     start_time = time.time()  # <-- Start timing here
+
+#     response = st.session_state.conversation({'question': user_question})
+
+#     end_time = time.time()  # <-- End timing here
+#     elapsed_time = end_time - start_time
+
+#     # Save timing data
+#     if 'query_times' not in st.session_state:
+#         st.session_state.query_times = []
+#     st.session_state.query_times.append(elapsed_time)
+
+#     st.session_state.chat_history = response['chat_history']
+
+#     # Replace [ ... ] with $$...$$ explicitly
+#     def convert_brackets_to_mathjax(text):
+#         return re.sub(r'\[(.+?)\]', r'$$\1$$', text, flags=re.DOTALL)
+
+#     for i, message in enumerate(st.session_state.chat_history):
+#         content = convert_brackets_to_mathjax(message.content)
+
+#         if i % 2 == 0:
+#             st.write(user_template.replace("{{MSG}}", content), unsafe_allow_html=True)
+#         else:
+#             st.write(bot_template.replace("{{MSG}}", content), unsafe_allow_html=True)
+
+#     # Display timing
+#     avg_time = sum(st.session_state.query_times) / len(st.session_state.query_times)
+#     st.write(f"⏱️ Query Time: {elapsed_time:.2f}s | Average Query Time: {avg_time:.2f}s")
 
 # ==============================
 # Main App Logic
