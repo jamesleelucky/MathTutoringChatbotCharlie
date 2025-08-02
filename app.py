@@ -44,8 +44,8 @@ def get_text(pdf_docs):
 def get_chunks(text):
     splitter = RecursiveCharacterTextSplitter(
         separators=["\nProblem", "\n\n", "\n", ".", " ", ""],
-        chunk_size=10000,  # Larger chunk to preserve context
-        chunk_overlap=900,
+        chunk_size=20000,  # Larger chunk to preserve context
+        chunk_overlap=1200,
         length_function=len
     )
     chunks = splitter.split_text(text)
