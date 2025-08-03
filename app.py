@@ -1,23 +1,50 @@
 import streamlit as st
 import sys
-import re 
-import time 
+import re
+import time
+import os
+import tempfile
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
-from langchain.text_splitter import CharacterTextSplitter
-from langchain_community.embeddings import OpenAIEmbeddings, HuggingFaceEmbeddings
+from pdf2image import convert_from_path
+import pytesseract
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.chat_models import ChatOpenAI
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
 from langchain.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
 from templates import css, bot_template, user_template
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+# Load environment variables
+load_dotenv()
+if not os.getenv("OPENAI_API_KEY"):
+    st.error("Missing API key. Please set OPENAI_API_KEY in your .env file.")
+    st.stop()
 
 st.set_page_config(page_title='Chat with multiple PDFs', page_icon=':books:')
 
 # ==============================
-# PDF Text Extraction
+# OCR Extraction with Temp Files (Optimized for Math)
+# ==============================
+def extract_text_with_ocr(pdf_files):
+    text = ""
+    for uploaded_file in pdf_files:
+        uploaded_file.seek(0)  # Reset pointer
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            tmp_file.write(uploaded_file.read())
+            tmp_path = tmp_file.name
+
+        images = convert_from_path(tmp_path, dpi=300)
+        for img in images:
+            text += pytesseract.image_to_string(img, lang="eng", config="--oem 1 --psm 6") + "\n"
+
+        os.remove(tmp_path)
+    return text
+
+# ==============================
+# Smart PDF Text Extraction with OCR fallback
 # ==============================
 def get_text(pdf_docs):
     text = ""
@@ -26,79 +53,80 @@ def get_text(pdf_docs):
         for page in pdf_reader.pages:
             extracted = page.extract_text()
             if extracted:
-                text += extracted
+                text += extracted + "\n"
+
+    # OCR fallback if text seems incomplete
+    if (
+        len(text.strip()) < 100 or
+        "____" in text or
+        ("Question" in text and "=" not in text)
+    ):
+        st.warning("Text seems incomplete. Switching to OCR...")
+        text = extract_text_with_ocr(pdf_docs)
+
     return text
 
 # ==============================
-# Text Chunking
+# Text Chunking (Reduced size for better accuracy)
 # ==============================
-# def get_chunks(text):
-#     text_splitter = CharacterTextSplitter(
-#         separator='\n',
-#         chunk_size=1000,
-#         chunk_overlap=200,
-#         length_function=len
-#     )
-#     chunks = text_splitter.split_text(text)
-#     return chunks
 def get_chunks(text):
     splitter = RecursiveCharacterTextSplitter(
-        separators=["\nProblem", "\n\n", "\n", ".", " ", ""],
-        chunk_size=20000,  # Larger chunk to preserve context
-        chunk_overlap=1200,
-        length_function=len
+        separators=["\nProblem", "\nQuestion", "\n\n", "\n", ".", " ", ""],
+        chunk_size=1200,  # Reduced for tighter context
+        chunk_overlap=150
     )
-    chunks = splitter.split_text(text)
-    return chunks
+    return splitter.split_text(text)
 
 # ==============================
-# Vector Store (FAISS)
+# FAISS Vector Store
 # ==============================
 def get_vectorstore(text_chunks):
-    if not text_chunks:  # Prevent IndexError
-        return None
     embeddings = OpenAIEmbeddings()
-    vectorstore = FAISS.from_texts(texts=text_chunks, embedding=embeddings)
-    return vectorstore
+    return FAISS.from_texts(texts=text_chunks, embedding=embeddings)
 
 # ==============================
-# Conversation Chain with Prompt
+# Translation (User Query → English)
+# ==============================
+
+def translate_to_english(text):
+    # Detect if text is mostly English letters and allowed math symbols
+    if re.fullmatch(r"[A-Za-z0-9\s\-\+\=\(\)\[\]\{\}\.,:;!?/*^∞Σ∫→√π]+", text):
+        return text.strip()  # Skip translation for English input
+
+    # If non-English characters found, call GPT for translation
+    llm = ChatOpenAI(model_name="gpt-4o", temperature=0)
+    prompt = f"Translate the following text to English without adding explanations. Keep all math symbols unchanged:\n\n{text}\n\nReturn only the translated text."
+    return llm.predict(prompt).strip()
+
+# ==============================
+# Conversation Chain with Updated Prompt
 # ==============================
 def get_conversation_chain(vectorstore):
-    llm = ChatOpenAI(
-        model_name="gpt-4o",  # Or gpt-3.5-turbo if needed
-        temperature=0.2
-    )
+    llm = ChatOpenAI(model_name="gpt-4o", temperature=0.2)
 
+    # Plain text with math symbols
     system_prompt = """
-        You are the most intelligent math tutor in this world. Solve ONLY the given question using the provided context.
-        Do NOT invent problems that are not in the question.
+    You are an expert math tutor. Solve the question clearly using normal math symbols in plain text (not LaTeX).
 
-        Format your response as:
+    Rules:
+    - DO NOT use LaTeX or MathJax ($ or $$).
+    - Use real math symbols where possible:
+      ∫ for integrals, Σ for summation, √ for square root, ∞ for infinity, → for limits.
+    - Write functions like f(x), g(x).
+    - For exponents, use superscript (x²) or x^2 if needed.
+    - Show all steps like a textbook, each on a new line.
+    - Include the original question before solving.
+    - At the end, write "Conclusion: ..." with the final answer.
 
-        Solution:
-        1. Explain what the equation is. 
-            Clearly state the equation using MathJax formatting.
-            - For inline math use single dollar signs: $...$
-            - For displayed equations use double dollar signs: $$...$$
-            DO NOT use square brackets [ ] or raw LaTeX commands without MathJax delimiters.
-
-        2. Show the steps to solve the problem. 
-            Clearly use MathJax formatting for all equations.
-            - Inline math: $...$
-            - Display math: $$...$$
-            DO NOT use square brackets [ ] for equations.
-
-        3. Conclusion:
-            State the final result.
-
-        Rules:
-        - Use clear English and MathJax for math.
-        - Do NOT approximate unless required.
-        - DO NOT use raw LaTeX outside of MathJax delimiters.
-        If possible, compute the numeric value.
+    Example:
+    Solution:
+    1. Question: Solve 3x - 7 = 14.
+    2. Add 7 to both sides:
+       3x = 21
+    3. Divide by 3:
+       x = 7
+    Conclusion: x = 7
     """
-
 
     messages = [
         SystemMessagePromptTemplate.from_template(system_prompt),
@@ -108,78 +136,41 @@ def get_conversation_chain(vectorstore):
     prompt = ChatPromptTemplate.from_messages(messages)
     memory = ConversationBufferMemory(memory_key='chat_history', return_messages=True)
 
-    conversation_chain = ConversationalRetrievalChain.from_llm(
+    # Increase k for better retrieval
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 8})
+
+    return ConversationalRetrievalChain.from_llm(
         llm=llm,
-        retriever=vectorstore.as_retriever(),
+        retriever=retriever,
         memory=memory,
         combine_docs_chain_kwargs={"prompt": prompt}
     )
-    return conversation_chain
 
 # ==============================
 # Display Chat
 # ==============================
-
 def handle_userinput(user_question):
-    response = st.session_state.conversation({'question': user_question})
+    translated_question = translate_to_english(user_question)
+    response = st.session_state.conversation({'question': translated_question})
     st.session_state.chat_history = response['chat_history']
 
-    # Replace [ ... ] with $$...$$ explicitly
-    def convert_brackets_to_mathjax(text):
-        return re.sub(r'\[(.+?)\]', r'$$\1$$', text, flags=re.DOTALL)
-
     for i, message in enumerate(st.session_state.chat_history):
-        content = convert_brackets_to_mathjax(message.content)
-        
         if i % 2 == 0:
-            st.write(user_template.replace("{{MSG}}", content), unsafe_allow_html=True)
+            st.write(user_template.replace("{{MSG}}", message.content), unsafe_allow_html=True)
         else:
-            st.write(bot_template.replace("{{MSG}}", content), unsafe_allow_html=True)
-
-# def handle_userinput(user_question):
-#     start_time = time.time()  # <-- Start timing here
-
-#     response = st.session_state.conversation({'question': user_question})
-
-#     end_time = time.time()  # <-- End timing here
-#     elapsed_time = end_time - start_time
-
-#     # Save timing data
-#     if 'query_times' not in st.session_state:
-#         st.session_state.query_times = []
-#     st.session_state.query_times.append(elapsed_time)
-
-#     st.session_state.chat_history = response['chat_history']
-
-#     # Replace [ ... ] with $$...$$ explicitly
-#     def convert_brackets_to_mathjax(text):
-#         return re.sub(r'\[(.+?)\]', r'$$\1$$', text, flags=re.DOTALL)
-
-#     for i, message in enumerate(st.session_state.chat_history):
-#         content = convert_brackets_to_mathjax(message.content)
-
-#         if i % 2 == 0:
-#             st.write(user_template.replace("{{MSG}}", content), unsafe_allow_html=True)
-#         else:
-#             st.write(bot_template.replace("{{MSG}}", content), unsafe_allow_html=True)
-
-#     # Display timing
-#     avg_time = sum(st.session_state.query_times) / len(st.session_state.query_times)
-#     st.write(f"⏱️ Query Time: {elapsed_time:.2f}s | Average Query Time: {avg_time:.2f}s")
+            st.write(bot_template.replace("{{MSG}}", message.content), unsafe_allow_html=True)
 
 # ==============================
-# Main App Logic
+# Main App
 # ==============================
 def main():
-    load_dotenv()
-
     if "conversation" not in st.session_state:
         st.session_state.conversation = None
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = None
 
     st.header('Chat with multiple PDFs :books:')
-    user_question = st.text_input("Ask questions about the documents you provided")
+    user_question = st.text_input("Ask questions in ANY language about your documents")
     if user_question:
         if st.session_state.conversation is None:
             st.warning("Please upload and process your PDFs first!")
@@ -198,19 +189,10 @@ def main():
                 with st.spinner("Processing..."):
                     raw_text = get_text(pdf_docs)
                     if not raw_text.strip():
-                        st.error("No text found in uploaded PDFs. Make sure they are not scanned images or use OCR.")
+                        st.error("No text found. Make sure the PDFs have text or use OCR.")
                         return
-
                     text_chunks = get_chunks(raw_text)
-                    if not text_chunks:
-                        st.error("No text chunks generated. Check your PDFs.")
-                        return
-
                     vector_store = get_vectorstore(text_chunks)
-                    if vector_store is None:
-                        st.error("Failed to create vector store.")
-                        return
-
                     st.session_state.conversation = get_conversation_chain(vector_store)
                     st.success("PDFs processed successfully!")
 
