@@ -1,7 +1,5 @@
 import streamlit as st
-import sys
 import re
-import time
 import os
 import tempfile
 from dotenv import load_dotenv
@@ -23,15 +21,43 @@ if not os.getenv("OPENAI_API_KEY"):
     st.error("Missing API key. Please set OPENAI_API_KEY in your .env file.")
     st.stop()
 
-st.set_page_config(page_title='Chat with multiple PDFs', page_icon=':books:')
+st.set_page_config(page_title='Chat with Multiple PDFs', page_icon=':books:')
 
 # ==============================
-# OCR Extraction with Temp Files (Optimized for Math)
+# Ordinal Mapping for words
+# ==============================
+ORDINAL_MAP = {
+    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
+    "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10
+}
+
+def normalize_problem_reference(text):
+    text = text.lower()
+
+    # Check for ordinal words like first, second
+    for word, num in ORDINAL_MAP.items():
+        if word in text:
+            return {"type": "ordinal", "value": num}
+
+    # Check for numeric ordinals: 1st, 2nd, 3rd, 23rd, etc.
+    match_suffix = re.search(r"(\d+)(st|nd|rd|th)", text)
+    if match_suffix:
+        return {"type": "ordinal", "value": int(match_suffix.group(1))}
+
+    # Check for explicit "problem/question X" or "#X"
+    match_number = re.search(r"(problem|question)?\s*#?\s*(\d+)", text)
+    if match_number:
+        return {"type": "number", "value": match_number.group(2)}
+
+    return None
+
+# ==============================
+# OCR Extraction
 # ==============================
 def extract_text_with_ocr(pdf_files):
     text = ""
     for uploaded_file in pdf_files:
-        uploaded_file.seek(0)  # Reset pointer
+        uploaded_file.seek(0)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
             tmp_file.write(uploaded_file.read())
             tmp_path = tmp_file.name
@@ -44,7 +70,7 @@ def extract_text_with_ocr(pdf_files):
     return text
 
 # ==============================
-# Smart PDF Text Extraction with OCR fallback
+# Extract text from PDFs
 # ==============================
 def get_text(pdf_docs):
     text = ""
@@ -55,89 +81,108 @@ def get_text(pdf_docs):
             if extracted:
                 text += extracted + "\n"
 
-    # OCR fallback if text seems incomplete
-    if (
-        len(text.strip()) < 100 or
-        "____" in text or
-        ("Question" in text and "=" not in text)
-    ):
-        st.warning("Text seems incomplete. Switching to OCR...")
+    if len(text.strip()) < 100 or "____" in text:
         text = extract_text_with_ocr(pdf_docs)
-
     return text
 
 # ==============================
-# Text Chunking (Reduced size for better accuracy)
+# Extract all problems from text
+# ==============================
+def extract_all_problems(all_text):
+    matches = re.split(r"(?=Problem\s*\d+)", all_text)
+    problems = [m.strip() for m in matches if m.strip().startswith("Problem")]
+    return problems
+
+def find_exact_problem(ref, problems):
+    if not problems:
+        return None
+
+    if ref["type"] == "number":
+        # Exact problem number match
+        for p in problems:
+            if re.search(rf"Problem\s*{ref['value']}\b", p):
+                return p
+    else:
+        # Ordinal match → nth problem in order
+        index = ref["value"] - 1
+        if 0 <= index < len(problems):
+            return problems[index]
+    return None
+
+# ==============================
+# Chunking & Filtering
 # ==============================
 def get_chunks(text):
     splitter = RecursiveCharacterTextSplitter(
         separators=["\nProblem", "\nQuestion", "\n\n", "\n", ".", " ", ""],
-        chunk_size=1200,  # Reduced for tighter context
+        chunk_size=1200,
         chunk_overlap=150
     )
     return splitter.split_text(text)
 
+def filter_chunks(chunks):
+    filtered = [ch for ch in chunks if ch.count("Problem") <= 3 and ch.count("Question") <= 1]
+    return filtered if filtered else chunks
+
 # ==============================
-# FAISS Vector Store
+# Vector Store
 # ==============================
 def get_vectorstore(text_chunks):
+    if not text_chunks:
+        st.error("No valid text chunks found. Check your PDF content.")
+        return None
     embeddings = OpenAIEmbeddings()
     return FAISS.from_texts(texts=text_chunks, embedding=embeddings)
 
 # ==============================
-# Translation (User Query → English)
+# Translate to English
 # ==============================
-
 def translate_to_english(text):
-    # Detect if text is mostly English letters and allowed math symbols
-    if re.fullmatch(r"[A-Za-z0-9\s\-\+\=\(\)\[\]\{\}\.,:;!?/*^∞Σ∫→√π]+", text):
-        return text.strip()  # Skip translation for English input
-
-    # If non-English characters found, call GPT for translation
     llm = ChatOpenAI(model_name="gpt-4o", temperature=0)
-    prompt = f"Translate the following text to English without adding explanations. Keep all math symbols unchanged:\n\n{text}\n\nReturn only the translated text."
-    return llm.predict(prompt).strip()
+    return llm.predict(f"Translate to English, keep math symbols unchanged:\n\n{text}")
 
 # ==============================
-# Conversation Chain with Updated Prompt
+# Clean LaTeX Output
+# ==============================
+def clean_math_output(text):
+    text = re.sub(r'\$+', '', text)
+    text = re.sub(r'\\frac\{(.+?)\}\{(.+?)\}', r'(\1/\2)', text)
+    text = re.sub(r'\\sqrt\{(.+?)\}', r'√(\1)', text)
+    text = re.sub(r'([a-zA-Z0-9])\^(\d+)', r'\1^\2', text)
+    text = text.replace("\\", "")
+    return text
+
+# ==============================
+# Conversation Chain
 # ==============================
 def get_conversation_chain(vectorstore):
-    llm = ChatOpenAI(model_name="gpt-4o", temperature=0.2)
+    llm = ChatOpenAI(model_name="gpt-4o", temperature=0)
 
-    # Plain text with math symbols
     system_prompt = """
-    You are an expert math tutor. Solve the question clearly using normal math symbols in plain text (not LaTeX).
-
-    Rules:
-    - DO NOT use LaTeX or MathJax ($ or $$).
-    - Use real math symbols where possible:
-      ∫ for integrals, Σ for summation, √ for square root, ∞ for infinity, → for limits.
-    - Write functions like f(x), g(x).
-    - For exponents, use superscript (x²) or x^2 if needed.
-    - Show all steps like a textbook, each on a new line.
-    - Include the original question before solving.
-    - At the end, write "Conclusion: ..." with the final answer.
-
-    Example:
-    Solution:
-    1. Question: Solve 3x - 7 = 14.
-    2. Add 7 to both sides:
-       3x = 21
-    3. Divide by 3:
-       x = 7
-    Conclusion: x = 7
+    You are an expert math tutor. Always respond in ENGLISH.
+    Answer ONLY the user's question. Ignore other questions in the context.
+    Do NOT use LaTeX, MathJax, or $ signs. Do NOT use \commands.
+    Use plain text math symbols: √, ∫, Σ, →, x² or x^2.
+    Show all steps clearly, one per line.
+    Begin with the original question, then the solution.
+    End with "Conclusion: ..." and the final answer.
     """
 
     messages = [
         SystemMessagePromptTemplate.from_template(system_prompt),
-        HumanMessagePromptTemplate.from_template("Context: {context}\n\nQuestion: {question}")
+        HumanMessagePromptTemplate.from_template("""
+        Context (for reference only, ignore other questions):
+        {context}
+
+        User Question:
+        {question}
+        """)
     ]
 
     prompt = ChatPromptTemplate.from_messages(messages)
     memory = ConversationBufferMemory(memory_key='chat_history', return_messages=True)
 
-    # Increase k for better retrieval
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 8})
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
 
     return ConversationalRetrievalChain.from_llm(
         llm=llm,
@@ -147,18 +192,35 @@ def get_conversation_chain(vectorstore):
     )
 
 # ==============================
-# Display Chat
+# Handle User Input
 # ==============================
 def handle_userinput(user_question):
     translated_question = translate_to_english(user_question)
-    response = st.session_state.conversation({'question': translated_question})
-    st.session_state.chat_history = response['chat_history']
+    ref = normalize_problem_reference(translated_question)
+    response_text = ""
 
-    for i, message in enumerate(st.session_state.chat_history):
-        if i % 2 == 0:
-            st.write(user_template.replace("{{MSG}}", message.content), unsafe_allow_html=True)
+    if ref and "problems_list" in st.session_state:
+        exact_context = find_exact_problem(ref, st.session_state["problems_list"])
+        if exact_context:
+            llm = ChatOpenAI(model_name="gpt-4o", temperature=0)
+            response_text = llm.predict(
+                f"Context (problem to solve):\n{exact_context}\n\n"
+                f"Solve ONLY the problem in the context above. Ignore the wording of the user question. "
+                f"Provide a detailed, step-by-step solution in plain text math (no LaTeX, no $ signs). "
+                f"Use √, Σ, ∫, and x^2 for powers. End with 'Conclusion: ...'."
+            )
         else:
-            st.write(bot_template.replace("{{MSG}}", message.content), unsafe_allow_html=True)
+            response_text = "Could not find the problem in the document."
+    else:
+        # For general conceptual questions → fallback to FAISS
+        response = st.session_state.conversation({'question': translated_question})
+        response_text = response['chat_history'][-1].content
+
+    if not re.search(r'[a-zA-Z]', response_text):
+        response_text = translate_to_english(response_text)
+
+    response_text = clean_math_output(response_text)
+    st.write(bot_template.replace("{{MSG}}", response_text), unsafe_allow_html=True)
 
 # ==============================
 # Main App
@@ -166,11 +228,10 @@ def handle_userinput(user_question):
 def main():
     if "conversation" not in st.session_state:
         st.session_state.conversation = None
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = None
 
-    st.header('Chat with multiple PDFs :books:')
-    user_question = st.text_input("Ask any TEXT-BASED math questions")
+    st.header('Chat with Multiple PDFs :books:')
+
+    user_question = st.text_input("Ask a complete text-based math question. ")
     if user_question:
         if st.session_state.conversation is None:
             st.warning("Please upload and process your PDFs first!")
@@ -178,23 +239,29 @@ def main():
             handle_userinput(user_question)
 
     with st.sidebar:
-        st.subheader("Your Documents")
-        pdf_docs = st.file_uploader("Upload your PDFs here and click 'Process'", accept_multiple_files=True)
-        process_button = st.button("Process")
-
-        if process_button:
+        st.subheader("Upload Documents")
+        pdf_docs = st.file_uploader("Upload ONLY text-based PDFs", accept_multiple_files=True)
+        if st.button("Process"):
             if not pdf_docs:
                 st.error("Please upload at least one PDF.")
             else:
                 with st.spinner("Processing..."):
                     raw_text = get_text(pdf_docs)
                     if not raw_text.strip():
-                        st.error("No text found. Make sure the PDFs have text or use OCR.")
+                        st.error("No text found. Make sure the PDFs have complete text or use OCR.")
                         return
+
+                    # Extract problems list for ordinal/numeric reference
+                    problems_list = extract_all_problems(raw_text)
+                    st.session_state["problems_list"] = problems_list
+
+                    # Prepare vectorstore for retrieval
                     text_chunks = get_chunks(raw_text)
-                    vector_store = get_vectorstore(text_chunks)
-                    st.session_state.conversation = get_conversation_chain(vector_store)
-                    st.success("PDFs processed successfully!")
+                    filtered_chunks = filter_chunks(text_chunks)
+                    vector_store = get_vectorstore(filtered_chunks)
+                    if vector_store:
+                        st.session_state.conversation = get_conversation_chain(vector_store)
+                        st.success("PDFs processed successfully!")
 
 if __name__ == '__main__':
     main()
