@@ -170,7 +170,7 @@ def main():
         st.session_state.chat_history = None
 
     st.header('Chat with multiple PDFs :books:')
-    user_question = st.text_input("Ask questions in ANY language about your documents")
+    user_question = st.text_input("Ask any TEXT-BASED math questions")
     if user_question:
         if st.session_state.conversation is None:
             st.warning("Please upload and process your PDFs first!")
