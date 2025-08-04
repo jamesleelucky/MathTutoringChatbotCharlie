@@ -118,7 +118,7 @@ def normalize_problem_reference(text):
                             r"eleventh|twelfth|thirteenth|fourteenth|fifteenth|sixteenth|"
                             r"seventeenth|eighteenth|nineteenth|twentieth|thirtieth|fortieth|"
                             r"fiftieth|sixtieth|seventieth|eightieth|ninetieth|"
-                            r"(twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)(\s+(one|two|three|four|five|six|seven|eight|nine|second|third|fourth|fifth|sixth|seventh|eighth|ninth))?)", text)
+                            r"(twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)(\s+(one|two|three|four|five|six|seven|eight|nine|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth))?)", text)
     if match_words:
         num = words_to_number(match_words.group(0))
         if num:
