@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 from PyPDF2 import PdfReader
 from pdf2image import convert_from_path
 import pytesseract
+import nltk
+from nltk.tokenize import sent_tokenize
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -22,6 +24,17 @@ if not os.getenv("OPENAI_API_KEY"):
     st.stop()
 
 st.set_page_config(page_title='Chat with Multiple PDFs', page_icon=':books:')
+
+# ==============================
+# Download NLTK resources
+# ==============================
+nltk.download('punkt')
+
+# ==============================
+# Math Keywords for NER-like extraction
+# ==============================
+MATH_KEYWORDS = ["limit", "derivative", "integral", "sequence", "series", "probability",
+                 "function", "logarithm", "exponential", "matrix", "vector", "sum"]
 
 # ==============================
 # Base number mappings
@@ -63,12 +76,11 @@ def normalize_problem_reference(text):
     text = re.sub(r"[^\w\s,]", "", text)
     text = re.sub(r"\s+", " ", text).strip()
 
-    # Handle 'last' references first
+    # Handle 'last'
     if "last" in text:
         words = text.split()
         if words.count("last") == 1 and len(words) <= 4:
             return {"type": "relative", "values": ["last"]}
-
         if "last" in words:
             idx = words.index("last")
             if idx > 0:
@@ -76,14 +88,13 @@ def normalize_problem_reference(text):
                 if prev_word in ["second", "third", "fourth", "fifth"]:
                     offset = {"second": 1, "third": 2, "fourth": 3, "fifth": 4}.get(prev_word)
                     return {"type": "relative", "values": [offset]}
-
         match_last = re.search(r"(second|third|fourth|fifth)\s+to\s+last", text)
         if match_last:
             ordinal_word = match_last.group(1)
             offset = {"second": 1, "third": 2, "fourth": 3, "fifth": 4}.get(ordinal_word)
             return {"type": "relative", "values": [offset]}
 
-    # Word-based ranges: "first three problems/questions"
+    # Word-based ranges
     match_word_range = re.search(r"first\s+(\w+)\s+(problems?|questions?)", text)
     if match_word_range:
         word_num = match_word_range.group(1)
@@ -115,10 +126,11 @@ def normalize_problem_reference(text):
 
     # Word-based ordinals
     match_words = re.search(r"(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|"
-                            r"eleventh|twelfth|thirteenth|fourteenth|fifteenth|sixteenth|"
-                            r"seventeenth|eighteenth|nineteenth|twentieth|thirtieth|fortieth|"
-                            r"fiftieth|sixtieth|seventieth|eightieth|ninetieth|"
-                            r"(twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)(\s+(one|two|three|four|five|six|seven|eight|nine|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth))?)", text)
+                        r"eleventh|twelfth|thirteenth|fourteenth|fifteenth|sixteenth|"
+                        r"seventeenth|eighteenth|nineteenth|twentieth|thirtieth|fortieth|"
+                        r"fiftieth|sixtieth|seventieth|eightieth|ninetieth|"
+                        r"(twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)(\s+(one|two|three|four|five|six|seven|eight|nine|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth))?)", text)
+
     if match_words:
         num = words_to_number(match_words.group(0))
         if num:
@@ -157,24 +169,48 @@ def get_text(pdf_docs):
     return text
 
 # ==============================
-# Problem extraction
+# Problem extraction with NLP
 # ==============================
 def extract_all_problems(all_text):
-    matches = re.split(r"(?=Problem\s*\d+)", all_text, flags=re.IGNORECASE)
-    return [m.strip() for m in matches if re.match(r"Problem\s*\d+", m, flags=re.IGNORECASE)]
+    all_text = re.sub(r"\s+", " ", all_text)  # Normalize spaces
+    # Split using regex + tokenize
+    regex_chunks = re.split(r"(?=(?:Problem\s*\d+|Question\s*\d+|\b\d+\s*[.)]))", all_text, flags=re.IGNORECASE)
+    problems = [m.strip() for m in regex_chunks if re.match(r"^(Problem\s*\d+|Question\s*\d+|\d+\s*[.)])", m, flags=re.IGNORECASE)]
+    # Sentence-level cleanup (optional)
+    return problems
 
+# ==============================
+# Extract keywords from user query
+# ==============================
+def extract_keywords(text):
+    keywords = []
+    for kw in MATH_KEYWORDS:
+        if kw in text.lower():
+            keywords.append(kw)
+    return keywords
+
+# ==============================
+# Semantic Fallback with keyword boost
+# ==============================
+def semantic_search_fallback(query, problems):
+    if not problems:
+        return None
+    embeddings = OpenAIEmbeddings()
+    vectorstore = FAISS.from_texts(problems, embedding=embeddings)
+    # Boost score for keyword matches
+    keywords = extract_keywords(query)
+    search_query = query + " " + " ".join(keywords)
+    result = vectorstore.similarity_search(search_query, k=1)
+    return result[0].page_content if result else None
+
+# ==============================
+# Find problem by index or semantic similarity
+# ==============================
 def find_exact_problem(idx, problems, raw_text=None):
+    pattern = rf"^(Problem\s*{idx}|Question\s*{idx}|{idx}\s*[.)])"
     for p in problems:
-        if re.search(rf"Problem\s*{idx}\b", p, re.IGNORECASE):
+        if re.match(pattern, p, flags=re.IGNORECASE):
             return p
-    if raw_text:
-        match = re.search(
-            rf"(Problem\s*{idx}\b.*?)(?=Problem\s*\d+\b|\Z)",
-            raw_text,
-            flags=re.DOTALL | re.IGNORECASE
-        )
-        if match:
-            return match.group(1).strip()
     return None
 
 # ==============================
@@ -195,44 +231,51 @@ def clean_math_output(text):
 # ==============================
 def handle_userinput(user_question):
     ref = normalize_problem_reference(user_question)
-    translated_question = user_question if ref else user_question
+    llm = ChatOpenAI(model_name="gpt-4o", temperature=0)
 
     if ref:
-        if ref["type"] == "relative":
-            total = len(st.session_state.get("problems_list", []))
-            if ref["values"] == ["last"]:
-                ref["values"] = [total]
-            else:
-                offsets = ref["values"]
-                ref["values"] = [total - offset for offset in offsets]
+        values = ref["values"]
+        total = len(st.session_state.get("problems_list", []))
+        if ref["type"] == "relative" and "last" in values:
+            values = [total]
 
-        llm = ChatOpenAI(model_name="gpt-4o", temperature=0)
-        responses = []
-        for idx in ref["values"]:
-            if idx <= 0 or idx > len(st.session_state.get("problems_list", [])):
-                responses.append((idx, "Invalid index or out of range."))
-                continue
-            context = find_exact_problem(idx, st.session_state.get("problems_list", []), st.session_state.get("raw_text"))
-            if context:
-                response = llm.predict(
-                    f"Context (Problem {idx}):\n{context}\n\n"
-                    f"Solve ONLY this problem. Ignore others.\n"
-                    f"Rules:\n"
-                    f"- DO NOT use LaTeX or MathJax.\n"
-                    f"- Use plain text math: √ for roots, ^ for powers, / for fractions.\n"
-                    f"- Show each step clearly.\n"
-                    f"End with: Conclusion: ..."
-                )
-                responses.append((idx, clean_math_output(response)))
+        contexts = []
+        for idx in values:
+            if 0 < idx <= total:
+                context = find_exact_problem(idx, st.session_state["problems_list"])
+                if context:
+                    contexts.append(f"Problem {idx}:\n{context}")
             else:
-                responses.append((idx, "Problem not found."))
+                # If index is invalid, ignore or note it
+                contexts.append(f"Problem {idx}: Not found.")
 
-        for idx, solution in responses:
-            st.markdown(f"### ✅ Solution for Problem {idx}\n```text\n{solution}\n```")
+        if contexts:
+            combined_context = "\n\n".join(contexts)
+            response = llm.predict(
+                f"Context:\n{combined_context}\n\n"
+                f"Solve each problem separately. For each problem:\n"
+                f"- Show steps clearly\n"
+                f"- Use plain text math (√ for roots, ^ for powers, / for fractions)\n"
+                f"- End each with: Conclusion: ...\n"
+                f"Do NOT use LaTeX."
+            )
+            clean_response = clean_math_output(response)
+            st.markdown(f"### ✅ Solutions\n```text\n{clean_response}\n```")
+        else:
+            st.markdown("⚠ Could not find any of the requested problems.")
     else:
-        response = st.session_state.conversation({'question': translated_question})
-        clean_response = clean_math_output(response['chat_history'][-1].content)
-        st.markdown(f"### ✅ Answer\n```text\n{clean_response}\n```")
+        # If no index, do semantic fallback
+        context = semantic_search_fallback(user_question, st.session_state["problems_list"])
+        if context:
+            response = llm.predict(
+                f"Context:\n{context}\n\nAnswer in plain text, show steps, end with Conclusion."
+            )
+            clean_response = clean_math_output(response)
+            st.markdown(f"### ✅ Answer\n```text\n{clean_response}\n```")
+        else:
+            response = st.session_state.conversation({'question': user_question})
+            clean_response = clean_math_output(response['chat_history'][-1].content)
+            st.markdown(f"### ✅ Answer\n```text\n{clean_response}\n```")
 
 # ==============================
 # Main app
@@ -261,6 +304,7 @@ def main():
                     raw_text = get_text(pdf_docs)
                     st.session_state["raw_text"] = raw_text
                     st.session_state["problems_list"] = extract_all_problems(raw_text)
+                    # st.write("DEBUG: Extracted problems:", st.session_state["problems_list"])
                     chunks = RecursiveCharacterTextSplitter(
                         separators=["\nProblem", "\nQuestion", "\n\n", "\n", ".", " ", ""],
                         chunk_size=1200,
