@@ -260,7 +260,7 @@ def handle_userinput(user_question):
                 f"Do NOT use LaTeX."
             )
             clean_response = clean_math_output(response)
-            st.markdown(f"### ✅ Solutions\n```text\n{clean_response}\n```")
+            st.markdown(f"### Solutions\n```text\n{clean_response}\n```")
         else:
             st.markdown("⚠ Could not find any of the requested problems.")
     else:
@@ -271,11 +271,11 @@ def handle_userinput(user_question):
                 f"Context:\n{context}\n\nAnswer in plain text, show steps, end with Conclusion."
             )
             clean_response = clean_math_output(response)
-            st.markdown(f"### ✅ Answer\n```text\n{clean_response}\n```")
+            st.markdown(f"### Answer\n```text\n{clean_response}\n```")
         else:
             response = st.session_state.conversation({'question': user_question})
             clean_response = clean_math_output(response['chat_history'][-1].content)
-            st.markdown(f"### ✅ Answer\n```text\n{clean_response}\n```")
+            st.markdown(f"### Answer\n```text\n{clean_response}\n```")
 
 # ==============================
 # Main app
