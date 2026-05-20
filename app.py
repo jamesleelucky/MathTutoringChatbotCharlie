@@ -15,9 +15,7 @@ from langchain.chat_models import ChatOpenAI
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
 
-# ==============================
 # Load environment variables
-# ==============================
 load_dotenv()
 if not os.getenv("OPENAI_API_KEY"):
     st.error("Missing API key. Please set OPENAI_API_KEY in your .env file.")
@@ -25,20 +23,14 @@ if not os.getenv("OPENAI_API_KEY"):
 
 st.set_page_config(page_title='Chat with Multiple PDFs', page_icon=':books:')
 
-# ==============================
 # Download NLTK resources
-# ==============================
 nltk.download('punkt')
 
-# ==============================
 # Math Keywords for NER-like extraction
-# ==============================
 MATH_KEYWORDS = ["limit", "derivative", "integral", "sequence", "series", "probability",
                  "function", "logarithm", "exponential", "matrix", "vector", "sum"]
 
-# ==============================
 # Base number mappings
-# ==============================
 BASE_NUMBERS = {
     "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
     "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
@@ -67,9 +59,7 @@ def words_to_number(text):
             num += TENS[word]
     return num if num > 0 else None
 
-# ==============================
 # Detect problem/question reference
-# ==============================
 def normalize_problem_reference(text):
     text = text.lower()
     text = text.replace("-", " ")
@@ -138,9 +128,7 @@ def normalize_problem_reference(text):
 
     return None
 
-# ==============================
 # PDF text extraction
-# ==============================
 def extract_text_with_ocr(pdf_files):
     text = ""
     for uploaded_file in pdf_files:
@@ -168,9 +156,7 @@ def get_text(pdf_docs):
         text = extract_text_with_ocr(pdf_docs)
     return text
 
-# ==============================
 # Problem extraction with NLP
-# ==============================
 def extract_all_problems(all_text):
     all_text = re.sub(r"\s+", " ", all_text)  # Normalize spaces
     # Split using regex + tokenize
@@ -179,9 +165,7 @@ def extract_all_problems(all_text):
     # Sentence-level cleanup (optional)
     return problems
 
-# ==============================
 # Extract keywords from user query
-# ==============================
 def extract_keywords(text):
     keywords = []
     for kw in MATH_KEYWORDS:
@@ -189,9 +173,7 @@ def extract_keywords(text):
             keywords.append(kw)
     return keywords
 
-# ==============================
 # Semantic Fallback with keyword boost
-# ==============================
 def semantic_search_fallback(query, problems):
     if not problems:
         return None
@@ -203,9 +185,7 @@ def semantic_search_fallback(query, problems):
     result = vectorstore.similarity_search(search_query, k=1)
     return result[0].page_content if result else None
 
-# ==============================
 # Find problem by index or semantic similarity
-# ==============================
 def find_exact_problem(idx, problems, raw_text=None):
     pattern = rf"^(Problem\s*{idx}|Question\s*{idx}|{idx}\s*[.)])"
     for p in problems:
@@ -213,9 +193,7 @@ def find_exact_problem(idx, problems, raw_text=None):
             return p
     return None
 
-# ==============================
 # Clean math output
-# ==============================
 def clean_math_output(text):
     text = re.sub(r'\$+', '', text)
     text = re.sub(r'\\[a-zA-Z]+', '', text)
@@ -226,9 +204,7 @@ def clean_math_output(text):
     text = text.replace("\\", "")
     return text.strip()
 
-# ==============================
 # Handle user input
-# ==============================
 def handle_userinput(user_question):
     ref = normalize_problem_reference(user_question)
     llm = ChatOpenAI(model_name="gpt-4o", temperature=0)
@@ -277,9 +253,7 @@ def handle_userinput(user_question):
             clean_response = clean_math_output(response['chat_history'][-1].content)
             st.markdown(f"### Answer\n```text\n{clean_response}\n```")
 
-# ==============================
 # Main app
-# ==============================
 def main():
     if "conversation" not in st.session_state:
         st.session_state.conversation = None
